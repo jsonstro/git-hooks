@@ -1,0 +1,168 @@
+#!/bin/bash
+
+# Written by Josh Sonstroem (jsonstro@ucsc.edu) for the UCSC DCO.Unix team, version 3.1 30 Sept 2016
+# An hook script to verify any sudoers files that are about to be committed.
+#
+# NOTE: This script can handle multiple sudoers files in the repo.
+
+# Redirect output to stderr.
+#exec 1>&2
+
+ccount=0
+declare -a scount
+declare -a failed
+declare -a nerrors
+
+cat /dev/null > /tmp/hashed_files
+cat /dev/null > /tmp/sudoers_files
+
+VALUE=$(cat)
+NEW_REV=$(echo $VALUE | cut -d" " -f2)
+OLD_REV=$(echo $VALUE | cut -d" " -f1)
+
+# These come in newest first
+COMMITSR=$(git show --format=format:%H --quiet $OLD_REV..$NEW_REV)
+# So I gotta reverse them to test sudoers logic
+COMMITS=$(echo ${COMMITSR} | awk '{ for (i=NF; i>1; i--) printf("%s ",$i); print $1; }' )
+
+# FNum is the sudoers path+file count
+fnum=0
+# LNum tracks the count of the last file used
+lnum=0
+
+# SCCount is the Sudoers Commit Count
+sccount=0
+
+for commit in $COMMITS; do
+    # CCount tracks the Commit Count
+    ccount=$(expr ${ccount} + 1)
+    # Creating a temp list of modified files per commit in cluster
+    touch /tmp/modified_files_${commit}
+    for ff in $(git diff --name-only $commit^..$commit); do
+        grep -q $ff /tmp/modified_files_${commit}
+        if [ $? -ne 0 ]; then
+            echo $ff >> /tmp/modified_files_${commit}
+        fi
+    done
+
+    # This is debug info for listing which files are in which commit
+    #echo " * Files in commit #${ccount} ($commit):"
+    #cat /tmp/modified_files_${commit}
+
+    # We are now inside the commit loop
+    # For each commit loop thru the files and see if any match sudoers
+    for file in $(cat /tmp/modified_files_${commit}); do
+        # do a check only on the sudoers files inside this commit
+        if [[ "$file" = *sudoers* ]]; then
+            # Hash the file and path and check if we have seen it before
+            hash=$(echo $file | md5sum | awk '{print $1}')
+            grep -q ${hash} /tmp/hashed_files
+            if [ "${?}" -ne "0" ]; then
+                # We've not seen it so add it to our lists of files
+                echo ${hash} >> /tmp/hashed_files
+                echo ${file} >> /tmp/sudoers_files
+            fi
+            # FNum is the line number of this file and path combo in the
+            # list of hashed files
+            fnum=$(grep -n ${hash} /tmp/hashed_files | cut -d: -f1)
+            # $ftail is just the file name, where $file is the whole path
+            ftail=$(echo ${file##*/})
+            if [ "$fnum" -ne "$lnum" ]; then
+                 # If the hash of this sudoers file is diff from the last
+                 # then increase SCount Sudoers Count by 1 
+                 scount[$fnum]=$(expr ${scount[$fnum]} + 1)
+            fi
+            # Increase Sudoers Commit Count by 1 as well
+            sccount=$(expr ${sccount} + 1)
+            # Use git to pull out that particular file from the commit
+            git show $commit:$file > "/tmp/$ftail.$fnum"
+            # This started requiring sudo now since we run the check as
+            # the 'stash' user who is unpriviliged
+            sudo /usr/sbin/visudo -c -f "/tmp/$ftail.$fnum"
+            if [ $? -ne 0 ]; then
+                # We failed this visudo check
+                echo "--> Sudoers syntax check failed for file: ${file}"
+                echo "--> (commit: ${commit} as '/tmp/${ftail}.${fnum}')"
+                failed[$fnum]=$(expr ${failed[$fnum]} + 1)
+                # Add this commit count to the list of failed commits
+                echo "${ccount}" >> /tmp/failed_on_commits.$fnum
+            else
+                # We passed this visudo check
+                echo "--> Sudoers syntax check passed for file: ${file}"
+                echo "--> (commit: ${commit} as '/tmp/${ftail}.${fnum}')"
+                failed[$fnum]=$(expr ${failed[$fnum]} + 0)
+            fi
+            # Cleanup the temp sudoers file
+            rm /tmp/$ftail.$fnum
+            # Set last number to current file number for next round
+            lnum=$fnum
+        fi
+    done
+    fnum=$(expr $fnum + 1)
+done
+
+# *** DEPRECATED: Index of failed is the line number in the list of hashed filepaths
+# # for s in "${failed[@]}"; do
+
+# NOW, for each sudoers file we found...
+for s in "${scount[@]}"; do
+
+    # Get the count of the last commit which was failed for this file
+    if [ -e /tmp/failed_on_commits.${s} ]; then
+       lastfail[${s}]=$(cat /tmp/failed_on_commits.${s} | tail -1)
+       nerrors[${s}]=$(cat /tmp/failed_on_commits.${s} | wc -l)
+    else
+       # If no file, then no fails since we create the file on the first error above
+       lastfail[${s}]=0
+       nerrors[${s}]=0
+    fi
+
+    # *** DEPRECATED: No longer gonna see this condition since we are looping thru an array of commits which had ***
+    # *** failed sudoers checks ***
+    # # if [ "${scount${${s}]}" -eq 0 ]; then
+    # #    # no sudoers files found so let 'em go scott free
+    # #    rm /tmp/failed_on_commits
+    # #    exit 0
+
+    # Get the filename of this particular sudoers file from the list
+    fname=$(cat /tmp/sudoers_files | head -${s} | tail -1)
+
+    # If the count[sub this paricular sudoers file] is less than the count of failed instances of this file...
+    if [ "${scount[${s}]}" -gt "${failed[${s}]}" ]; then
+        # We've found more instances of sudoers files commited than we had failed visudo runs
+        if [ ${ccount} -eq ${lastfail[${s}]} ]; then
+            # Total number of commits is equal to last failed commit bail with exitcode of $failed
+            echo "*** Fail! *** [${nerrors[${s}]}] commit(s) of sudoers file ($fname) contains errors (code: ${failed[${s}]})"
+            rm /tmp/failed_on_commits.*
+            rm -f /tmp/modified_files*
+            rm /tmp/hashed_files
+            rm /tmp/sudoers_files
+            exit ${failed[${s}]}
+        else
+            # OK $lastfail was less than total count of sudoers so we can let 'em go scott free
+            if [ "${failed[${s}]}" -eq 0 ]; then
+                # No errors
+                echo "*** Pass! *** No [${nerrors[${s}]}] error(s) in file ($fname), all commits are clean -- 'great job!' =)"
+            else
+                # Had some errors, but they were further back for this file than the count of the last commit
+                echo "*** Pass! *** You had [${nerrors[${s}]}] error(s) in file ($fname), but last commit is clean -- 'good for you' ;)"
+                rm /tmp/failed_on_commits.*
+            fi
+            continue
+        fi
+    else
+        # if we get here, bail with $failed, b/c sudoers count is same as total number of failed checks for some file
+        echo "*** Fail! *** [${nerrors[${s}]}/${sccount}] commits of sudoers file ($fname) had errors (code: ${failed[${s}]}) [${ccount} total commits]"
+        rm /tmp/hashed_files
+        rm /tmp/sudoers_files
+        rm /tmp/failed_on_commits.*
+        rm -f /tmp/modified_files*
+        exit ${failed[${s}]}
+    fi
+done
+
+# If we make it here we are good to go, cleanup and exit with 0
+rm /tmp/hashed_files
+rm /tmp/sudoers_files
+rm -f /tmp/modified_files*
+exit 0
